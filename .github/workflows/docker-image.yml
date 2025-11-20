@@ -5,13 +5,20 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  # --- 新增部分：允许手动触发 ---
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '镜像 Tag (例如: v1.0, 0623, latest)'
+        required: false
+        default: 'latest'
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write  # 必须授予写入 packages (GHCR) 的权限
+      packages: write
 
     steps:
       - name: Checkout repository
@@ -19,9 +26,7 @@ jobs:
         
       - name: Download and extract camoufox
         run: |
-          # 下载 camoufox
           wget https://github.com/daijro/camoufox/releases/download/v135.0.1-beta.24/camoufox-135.0.1-beta.24-lin.x86_64.zip
-          # 解压并重命名为 camoufox-linux
           unzip camoufox-135.0.1-beta.24-lin.x86_64.zip -d camoufox-linux
           
       - name: Log in to GitHub Container Registry
@@ -29,15 +34,27 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}  # 自动使用 GitHub Token 认证
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push Docker image
+        env:
+          # 如果是手动触发，使用输入的 tag；如果是 push 触发，使用 'latest'
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          # 设置镜像标签
-          IMAGE_TAG=0623
+          # 1. 处理所有者名称为小写 (Docker 要求)
           REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          # 构建镜像
+          
+          # 2. 确定 Tag
+          if [ -z "$INPUT_TAG" ]; then
+            IMAGE_TAG="latest"
+          else
+            IMAGE_TAG="$INPUT_TAG"
+          fi
+          
+          echo "正在构建镜像: ghcr.io/$REPO_OWNER/build-server:$IMAGE_TAG"
+          
+          # 3. 构建
           docker build . --file Dockerfile --tag ghcr.io/$REPO_OWNER/build-server:$IMAGE_TAG
-          # 推送镜像
+          
+          # 4. 推送
           docker push ghcr.io/$REPO_OWNER/build-server:$IMAGE_TAG
-
