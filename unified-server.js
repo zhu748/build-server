@@ -438,18 +438,41 @@ class ProxyServerSystem extends EventEmitter {
   }
 
   _loadConfig() {
+    // 1. 默认配置
     let conf = {
       httpPort: 8889, host: '0.0.0.0', wsPort: 9998, streamingMode: 'real',
-      failureThreshold: 0, maxRetries: 3, retryDelay: 2000, apiKeys: [], debugMode: false
+      failureThreshold: 0, maxRetries: 3, retryDelay: 2000, apiKeys: [], 
+      debugMode: false, browserExecutablePath: null, immediateSwitchStatusCodes: []
     };
+
+    // 2. 加载 config.json (如果存在)
     try {
       if (fs.existsSync('config.json')) Object.assign(conf, JSON.parse(fs.readFileSync('config.json')));
     } catch (e) {}
+
+    // 3. 加载环境变量 (覆盖 config.json) - 恢复丢失的逻辑
     if (process.env.PORT) conf.httpPort = parseInt(process.env.PORT);
+    if (process.env.HOST) conf.host = process.env.HOST;
     if (process.env.STREAMING_MODE) conf.streamingMode = process.env.STREAMING_MODE;
-    if (process.env.API_KEYS) conf.apiKeys = process.env.API_KEYS.split(',');
+    
+    if (process.env.FAILURE_THRESHOLD) conf.failureThreshold = parseInt(process.env.FAILURE_THRESHOLD);
+    if (process.env.MAX_RETRIES) conf.maxRetries = parseInt(process.env.MAX_RETRIES);
+    if (process.env.RETRY_DELAY) conf.retryDelay = parseInt(process.env.RETRY_DELAY);
+    
+    if (process.env.DEBUG_MODE) conf.debugMode = (process.env.DEBUG_MODE === 'true');
+    if (process.env.INITIAL_AUTH_INDEX) conf.initialAuthIndex = parseInt(process.env.INITIAL_AUTH_INDEX);
+    if (process.env.CAMOUFOX_EXECUTABLE_PATH) conf.browserExecutablePath = process.env.CAMOUFOX_EXECUTABLE_PATH;
+
+    if (process.env.API_KEYS) conf.apiKeys = process.env.API_KEYS.split(',').map(k => k.trim()).filter(Boolean);
+    
+    if (process.env.IMMEDIATE_SWITCH_STATUS_CODES) {
+        conf.immediateSwitchStatusCodes = process.env.IMMEDIATE_SWITCH_STATUS_CODES
+            .split(',').map(c => parseInt(c)).filter(c => !isNaN(c));
+    }
+
     return conf;
   }
+
 
   // ✅ 恢复的核心鉴权中间件
   _createAuthMiddleware() {
@@ -660,3 +683,4 @@ class ProxyServerSystem extends EventEmitter {
 
 if (require.main === module) new ProxyServerSystem().start();
 module.exports = { ProxyServerSystem };
+
