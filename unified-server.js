@@ -8,7 +8,7 @@ const { firefox } = require('playwright');
 const os = require('os');
 
 // ===================================================================================
-// 认证源管理模块 (保持原版逻辑以支持仪表盘)
+// 认证源管理模块
 // ===================================================================================
 class AuthSource {
   constructor(logger) {
@@ -89,7 +89,7 @@ class AuthSource {
 }
 
 // ===================================================================================
-// 浏览器管理模块 (保留了原版健壮的启动逻辑)
+// 浏览器管理模块 (包含健壮启动逻辑)
 // ===================================================================================
 class BrowserManager {
   constructor(logger, config, authSource) {
@@ -118,12 +118,10 @@ class BrowserManager {
     const storageState = this.authSource.getAuth(authIndex);
     if (!storageState) throw new Error(`无法加载账号 ${authIndex}`);
 
-    // 自动修正 Cookie
     if (storageState.cookies) {
       storageState.cookies.forEach(c => { if (!['Lax', 'Strict', 'None'].includes(c.sameSite)) c.sameSite = 'None'; });
     }
 
-    // 读取注入脚本
     let scriptContent = "console.log('Script missing');";
     try {
       const scriptPath = path.join(__dirname, this.scriptFileName);
@@ -148,7 +146,6 @@ class BrowserManager {
       this.logger.info('[浏览器] 访问 AI Studio...');
       await this.page.goto('https://aistudio.google.com/u/0/apps/bundled/blank?showAssistant=true&showCode=true', { timeout: 60000, waitUntil: 'networkidle' });
 
-      // === 原版健壮的启动逻辑 ===
       this.logger.info('[浏览器] 等待页面稳定...');
       await this.page.waitForTimeout(5000);
       try { await this.page.mouse.click(100, 100); } catch(e){}
@@ -161,7 +158,6 @@ class BrowserManager {
       let editorVisible = false;
       let clicks = 0;
       
-      // 死磕 Code 按钮直到编辑器出现
       while (!editorVisible && clicks < 60) {
         try {
            if (await editorContainer.isVisible()) { editorVisible = true; break; }
@@ -278,7 +274,7 @@ class ConnectionRegistry extends EventEmitter {
 }
 
 // ===================================================================================
-// 请求处理器 (优化版：兼容 OpenAI 格式心跳)
+// 请求处理器 (OpenAI 格式兼容版)
 // ===================================================================================
 class RequestHandler {
   constructor(system, registry, logger, browserMgr) {
@@ -292,10 +288,8 @@ class RequestHandler {
   get config() { return this.system.config; }
 
   async processRequest(req, res) {
-    if (this.config.apiKeys.length > 0 && req.query.key && !this.config.apiKeys.includes(req.query.key)) {
-      delete req.query.key;
-    }
-
+    // 注意：鉴权现在由中间件统一处理，这里不需要再删 key
+    
     this.system.stats.totalCalls++;
     const currentAuth = this.browserMgr.currentAuthIndex;
     if (!this.system.stats.accountCalls[currentAuth]) this.system.stats.accountCalls[currentAuth] = { total: 0, models: {} };
@@ -336,7 +330,6 @@ class RequestHandler {
     else throw new Error('WS Disconnected');
   }
 
-  // ✅ 核心优化：OpenAI 兼容格式心跳，防止 NextChat 等客户端报错
   _getKeepAliveChunk(req) {
     const common = { created: Math.floor(Date.now() / 1000) };
     if (req.path.includes('chat/completions')) {
@@ -350,7 +343,6 @@ class RequestHandler {
 
   async _handlePseudoStream(proxyReq, queue, req, res) {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
-    // 发送心跳防止超时
     const keepAlive = setInterval(() => res.write(this._getKeepAliveChunk(req)), 2000);
 
     try {
@@ -367,7 +359,6 @@ class RequestHandler {
         clearInterval(keepAlive);
         this.failureCount = 0;
         
-        // Fake 模式下，浏览器发回一个完整的大包
         const dataMsg = await queue.dequeue(); 
         if (msg.data) res.write(`data: ${msg.data}\n\n`);
         if (dataMsg && dataMsg.data) res.write(`data: ${dataMsg.data}\n\n`);
@@ -430,7 +421,7 @@ class RequestHandler {
 }
 
 // ===================================================================================
-// 系统主类 (保留仪表盘API支持)
+// 系统主类 (包含被恢复的 Auth 和 仪表盘功能)
 // ===================================================================================
 class ProxyServerSystem extends EventEmitter {
   constructor() {
@@ -460,6 +451,28 @@ class ProxyServerSystem extends EventEmitter {
     return conf;
   }
 
+  // ✅ 恢复的核心鉴权中间件
+  _createAuthMiddleware() {
+    return (req, res, next) => {
+      const keys = this.config.apiKeys;
+      if (!keys || keys.length === 0) return next();
+
+      // 支持多种传参方式: query param, x-goog-api-key, Authorization Bearer
+      let clientKey = req.query.key || req.headers['x-goog-api-key'] || req.headers['x-api-key'];
+      if (!clientKey && req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
+        clientKey = req.headers.authorization.substring(7);
+      }
+
+      if (clientKey && keys.includes(clientKey)) {
+        if (req.query.key) delete req.query.key; // 隐藏 key
+        return next();
+      }
+      
+      this.logger.warn(`拒绝未授权访问: ${req.ip}`);
+      res.status(401).json({ error: { message: "Invalid or missing API Key" } });
+    };
+  }
+
   async start() {
     const index = this.config.initialAuthIndex || this.authSource.getFirstAvailableIndex();
     await this.browserMgr.launchBrowser(index);
@@ -468,12 +481,31 @@ class ProxyServerSystem extends EventEmitter {
     app.use(express.json({ limit: '50mb' }));
     app.use(express.raw({ type: '*/*', limit: '50mb' }));
 
-    // === 仪表盘 API 支持 ===
+    // ✅ 恢复：仪表盘重定向
     app.get('/', (req, res) => res.redirect('/dashboard'));
     app.get('/dashboard', (req, res) => res.send(this._getDashboardHtml()));
     
-    // 仪表盘数据接口
-    app.get('/dashboard/data', (req, res) => {
+    // ✅ 恢复：仪表盘 API 验证
+    app.post('/dashboard/verify-key', (req, res) => {
+        const { key } = req.body;
+        if (!this.config.apiKeys.length || this.config.apiKeys.includes(key)) {
+            return res.json({ success: true });
+        }
+        res.status(401).json({ success: false });
+    });
+
+    // ✅ 恢复：仪表盘 API 保护中间件
+    const dashboardAuth = (req, res, next) => {
+        const key = req.headers['x-dashboard-auth'];
+        if (!this.config.apiKeys.length || (key && this.config.apiKeys.includes(key))) {
+            return next();
+        }
+        res.status(401).json({ error: 'Unauthorized' });
+    };
+
+    const apiRouter = express.Router();
+    apiRouter.use(dashboardAuth);
+    apiRouter.get('/data', (req, res) => {
       res.json({
         status: { uptime: process.uptime(), connected: !!this.browserMgr.browser, streamingMode: this.streamingMode },
         auth: { currentAuthIndex: this.browserMgr.currentAuthIndex, accounts: this.authSource.getAccountDetails() },
@@ -481,27 +513,27 @@ class ProxyServerSystem extends EventEmitter {
         config: this.config
       });
     });
-
-    // 动态切换接口
-    app.post('/switch', async (req, res) => {
-      try {
-         await this.browserMgr.switchAccount(this.handler._getNextAuthIndex());
-         res.send("Switched");
-      } catch(e) { res.status(500).send(e.message); }
+    apiRouter.post('/switch', async (req, res) => {
+        try {
+           await this.browserMgr.switchAccount(this.handler._getNextAuthIndex());
+           res.send("Switched");
+        } catch(e) { res.status(500).send(e.message); }
     });
-
-    // 动态配置接口
-    app.post('/dashboard/config', (req, res) => {
+    apiRouter.post('/config', (req, res) => {
         if(req.body.streamingMode) {
             this.config.streamingMode = req.body.streamingMode;
             this.streamingMode = req.body.streamingMode;
         }
         res.json({success: true});
     });
+    
+    // 挂载仪表盘路由
+    app.use('/dashboard', apiRouter);
 
-    // 代理所有流量
-    app.all('*', (req, res, next) => {
-      if (req.path.startsWith('/dashboard') || req.path.startsWith('/switch')) return next();
+    // ✅ 恢复：主代理路由鉴权
+    app.use(this._createAuthMiddleware());
+    app.all('*', (req, res) => {
+      if (req.path.startsWith('/dashboard')) return; // 防止意外匹配
       this.handler.processRequest(req, res);
     });
 
@@ -512,66 +544,115 @@ class ProxyServerSystem extends EventEmitter {
     this.logger.info(`系统启动完成: http://${this.config.host}:${this.config.httpPort}`);
   }
 
+  // ✅ 恢复：完整的仪表盘 HTML 和 登录逻辑
   _getDashboardHtml() {
-    // 返回简化但功能完整的仪表盘 HTML
     return `<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8"><title>Proxy Dashboard</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@1/css/pico.min.css">
-    <style>body{padding:20px;max-width:800px;margin:0 auto} .card{padding:20px;margin-bottom:20px;border:1px solid #333;border-radius:8px}</style>
+    <style>body{padding:20px;max-width:800px;margin:0 auto} .card{padding:20px;margin-bottom:20px;border:1px solid #333;border-radius:8px} .hidden{display:none}</style>
     </head><body>
-    <nav><ul><li><strong>🐢 Proxy Dashboard</strong></li></ul></nav>
-    <div class="grid">
-      <article>
-        <header>状态</header>
-        <div id="status">加载中...</div>
-      </article>
-      <article>
-        <header>控制</header>
-        <button onclick="switchAccount()">🔄 切换账号</button>
-        <label>
-          流式模式
-          <select id="modeSelect" onchange="changeMode(this.value)">
-            <option value="real">Real (真流式)</option>
-            <option value="fake">Fake (假流式/防超时)</option>
-          </select>
-        </label>
-      </article>
+    
+    <div id="loginLayer">
+        <article>
+            <header>🔐 需要认证</header>
+            <input type="password" id="apiKeyInput" placeholder="请输入 API Key">
+            <button onclick="verifyKey()">进入仪表盘</button>
+        </article>
     </div>
-    <article>
-      <header>账号池</header>
-      <div id="accounts"></div>
-    </article>
+
+    <div id="mainLayer" class="hidden">
+        <nav><ul><li><strong>🐢 Proxy Dashboard</strong></li></ul></nav>
+        <div class="grid">
+          <article>
+            <header>状态</header>
+            <div id="status">加载中...</div>
+          </article>
+          <article>
+            <header>控制</header>
+            <button onclick="switchAccount()">🔄 切换账号</button>
+            <label>
+              流式模式
+              <select id="modeSelect" onchange="changeMode(this.value)">
+                <option value="real">Real (真流式)</option>
+                <option value="fake">Fake (假流式/防超时)</option>
+              </select>
+            </label>
+          </article>
+        </div>
+        <article>
+          <header>账号池</header>
+          <div id="accounts"></div>
+        </article>
+    </div>
+
     <script>
-      async function refresh() {
-        const res = await fetch('/dashboard/data');
-        const data = await res.json();
-        document.getElementById('status').innerHTML = 
-          '运行时间: ' + Math.floor(data.status.uptime) + 's<br>' +
-          '浏览器: ' + (data.status.connected ? '✅ 已连接' : '❌ 断开') + '<br>' +
-          '当前账号: ' + data.auth.currentAuthIndex + '<br>' + 
-          '总调用: ' + data.stats.totalCalls;
-        
-        document.getElementById('modeSelect').value = data.config.streamingMode;
-        
-        const accHtml = data.auth.accounts.map(a => 
-            '<mark>' + a.index + ' (' + a.source + ')</mark>'
-        ).join(' ');
-        document.getElementById('accounts').innerHTML = accHtml;
+      const KEY_STORAGE = 'dashboard_key';
+      let currentKey = localStorage.getItem(KEY_STORAGE) || '';
+
+      async function verifyKey() {
+          const input = document.getElementById('apiKeyInput').value;
+          const keyToUse = input || currentKey;
+          
+          try {
+              const res = await fetch('/dashboard/verify-key', {
+                  method: 'POST',
+                  headers: {'Content-Type': 'application/json'},
+                  body: JSON.stringify({key: keyToUse})
+              });
+              const data = await res.json();
+              if(data.success) {
+                  currentKey = keyToUse;
+                  localStorage.setItem(KEY_STORAGE, currentKey);
+                  document.getElementById('loginLayer').classList.add('hidden');
+                  document.getElementById('mainLayer').classList.remove('hidden');
+                  refresh();
+                  setInterval(refresh, 2000);
+              } else {
+                  alert('密钥无效');
+                  localStorage.removeItem(KEY_STORAGE);
+              }
+          } catch(e) { alert('连接失败'); }
       }
+
+      function getHeaders() { return {'X-Dashboard-Auth': currentKey, 'Content-Type': 'application/json'}; }
+
+      async function refresh() {
+        try {
+            const res = await fetch('/dashboard/data', {headers: getHeaders()});
+            if(res.status === 401) return location.reload();
+            const data = await res.json();
+            
+            document.getElementById('status').innerHTML = 
+              '运行时间: ' + Math.floor(data.status.uptime) + 's<br>' +
+              '浏览器: ' + (data.status.connected ? '✅ 已连接' : '❌ 断开') + '<br>' +
+              '当前账号: ' + data.auth.currentAuthIndex + '<br>' + 
+              '总调用: ' + data.stats.totalCalls;
+            
+            document.getElementById('modeSelect').value = data.config.streamingMode;
+            
+            const accHtml = data.auth.accounts.map(a => 
+                '<mark>' + a.index + ' (' + a.source + ')</mark>'
+            ).join(' ');
+            document.getElementById('accounts').innerHTML = accHtml;
+        } catch(e) {}
+      }
+
       async function switchAccount() {
-        await fetch('/switch', {method:'POST'});
+        await fetch('/dashboard/switch', {method:'POST', headers: getHeaders()});
         setTimeout(refresh, 1000);
       }
+
       async function changeMode(mode) {
         await fetch('/dashboard/config', {
             method:'POST', 
-            headers:{'Content-Type':'application/json'},
+            headers: getHeaders(),
             body: JSON.stringify({streamingMode: mode})
         });
         refresh();
       }
-      setInterval(refresh, 2000);
-      refresh();
+
+      // 自动尝试登录
+      if(currentKey) verifyKey();
     </script>
     </body></html>`;
   }
